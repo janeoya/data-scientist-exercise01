@@ -1,0 +1,71 @@
+---
+title: "1_census_sqlite_pull"
+author: "Jane Williford"
+date: "2023-01-30"
+description: This program connects to the sqlite 1996 US Census database, joins all tables to 'records' by the correct _id variable, and exports a flattened csv file
+input: Connection to exercise01.sqlite database
+output: flat.csv 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+```{r}
+library(here)
+library(tidyverse)
+library(conflicted)
+library(RSQLite)
+
+conflicted::conflict_prefer("select","tidyverse")
+
+# confirm here() is mapping to the correct project directory
+here()
+```
+
+# 1) Create a consolidated dataset called 'flat' from the normalized tables in the database and export the table to a CSV file called 'flat.csv'
+    Input: DBI Connection to the exercise01.sqlite database
+    Output: flat.csv in the 'data' sub folder to be used in 2_census_eda.Rmd and 3_census_modeling.Rmd
+
+```{r}
+# connect to the SQLite database
+db_connection <- dbConnect( SQLite(), dbname = here("exercise01.sqlite"))
+
+# Get the records table from the database and merge in 8 other tables in the database to pull in the names of the id variables
+# Rename all variables with a suffix '_name'
+flat <- dbGetQuery(db_connection, 
+                 "select r.id, age, workclass_id, education_level_id, education_num, marital_status_id, occupation_id, relationship_id,
+                      race_id, sex_id, capital_gain, capital_loss, hours_week, country_id, over_50k,
+                      w.name as workclass_name,
+                      el.name as education_level_name,
+                      ms.name as marital_status_name,
+                      o.name as occupation_name,
+                      ra.name as race_name,
+                      s.name as sex_name,
+                      c.name as country_name,
+                      re.name as relationship_name
+                  from records as r
+                      left join workclasses as w on r.workclass_id = w.id
+                      left join education_levels as el on r.education_level_id = el.id
+                      left join marital_statuses as ms on r.marital_status_id = ms.id
+                      left join occupations as o on r.occupation_id = o.id
+                      left join races as ra on r.race_id = ra.id
+                      left join sexes as s on r.sex_id = s.id
+                      left join countries as c on r.country_id = c.id
+                      left join relationships as re on r.relationship_id=re.id;"
+                 )
+
+# disconnect from the database
+dbDisconnect(db_connection)
+
+# confirm we have the same number of rows and columns as we would expect
+nrow(flat)
+ncol(flat)
+# still have 48,842 individuals and 23 columns (8 additional from the original 15 in records)
+
+# write to a csv file in the Data subfolder
+write.csv(flat,file= here("Data","flat.csv"), row.names= FALSE)
+
+```
+

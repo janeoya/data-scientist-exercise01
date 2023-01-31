@@ -1,0 +1,319 @@
+---
+title: "2_census_eda"
+author: "Jane Williford"
+date: "2023-01-30"
+description: This program explores all variables from the flat.csv, generating plots and summary statistics looking at individual variables and each variable's relationship with the outcome (over_50k)
+input: flat.csv 
+output: n/a - graphics and findings printed within the script, not saved externally
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1) Load libraries
+```{r}
+library(here)
+library(tidyverse)
+library(conflicted)
+library(RSQLite)
+
+# Default to dplyr::select and dplyr::filter if there is a conflict
+conflicted::conflict_prefer("select","tidyverse")
+conflicted::conflict_prefer("filter","dplyr")
+
+# confirm here() is mapping to the correct project directory
+here()
+```
+
+# 2) Read the CSV into R and create a dataset to perform initial exploratory data analysis on
+    Input: flat.csv from the Data subfolder
+    Output: flat_eda dataframe- a dataset to perform initial EDA (has all missing values converted to a .NA value, and removed all _id variables)
+    
+```{r}
+# Read data and store as a dataframe called flat
+flat <- read.csv(file= here("Data","flat.csv"))
+
+# Remove all _ID variables since this information is captured in the _name variables
+# Remove the values that stand for NA in the data frame (discovered during initial database exploration)
+  # Replace the missing data in records with a .NA rather than the '?' (workclass_name, occupation_name, country_name)
+  # For capital_gain, replace the 99999 values with .NA
+  # for hours_week, replace the 99 values with .NA
+
+flat_eda <- flat %>% 
+  select(-ends_with("_id")) %>% 
+  mutate_at(vars(workclass_name, occupation_name, country_name), ~replace(., . == "?", NA)) %>%
+  mutate(capital_gain= replace(capital_gain, capital_gain == 99999, NA)) %>% 
+  mutate(hours_week= replace(hours_week, hours_week == 99, NA))
+
+```
+
+# 3) Explore the target variable that will be predicted eventually (over_50k: whether or not the individual makes over 50,000/ year)
+    Input: flat_eda dataframe- output from #2
+    Output: * flat_eda dataframe- where over_50k is now coded as a factor
+            * printed counts + proportions of the target variable
+    Main Findings: 24% of people in the dataset have the target (not a rare event)
+
+```{r}
+# Make target variable a factor for future programming
+flat_eda$over_50k= as.factor(flat_eda$over_50k)
+
+# Explore the counts and percentages of the target categories
+table(flat_eda$over_50k)
+prop.table(table(flat_eda$over_50k))
+
+# 11,687 make over 50K (24% of people)
+# 37,155 make equal to or under 50K (76%)
+
+# we are not modeling a rare event so we don't need to do any weighting of that kind
+```
+
+
+# 4) Explore all categorical variables that may be used as predictors in a future classification model predicting over_50k
+    Input: flat_eda dataframe- output from #3
+    Output: * flat_eda dataframe- where all categorical variables are now coded as a factors and the education_level_name variable has ordered levels
+            * Printed bar graphs and frequency tables for each categorical variable
+    Main Findings: 
+            * Decided to keep the education_level_name variable as a predictor and not use the education_num variable
+            * Decided to not collapse levels within workclass_name
+            * Population in sample does not seem representative of the US population
+    
+```{r}
+# list all potential character predictor variables in the dataframe
+cat_vars <- flat_eda %>% select_if(is.character) %>% colnames() 
+
+# make all character variables factors to to work with in R
+flat_eda <- flat_eda %>%  mutate_at(cat_vars, as.factor) 
+
+# figure out correct order for education_level by running a crosstab of the education level by the education number
+table(flat_eda$education_level_name,flat_eda$education_num ) 
+
+# add levels to the education_level_name variable since there is an order I want to see plots in
+flat_eda$education_level_name <-  fct_relevel(flat_eda$education_level_name, "Preschool","1st-4th","5th-6th", "7th-8th","9th", "10th", "11th", "12th", "HS-grad","Some-college", "Assoc-voc", "Assoc-acdm","Bachelors", "Masters","Prof-school","Doctorate")
+
+# CONSIDER: Do I want to use the numeric education variable, or use the factor version?
+  # DECISION: Decided to use the categorical education_level_name variable since the jump between each level didn't feel super even to me
+
+# print frequency tables and bar charts for all categorical potential predictor variables
+for (var in cat_vars) {
+  print(flat_eda %>% count(!!sym(var)) %>% arrange(desc(n)))
+  
+  print( ggplot(data=flat_eda, aes(x = !!sym(var))) +
+            geom_bar(stat = "count") +
+            ggtitle(paste("Bar Chart for", var)) +
+            theme_minimal() +
+            theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)))
+}
+
+# CONSIDER: Do I want to combine categories of variables in work class to prevent the level being a perfect predictor of the outcome?
+  # DECISION: Depends on classification model selected - since Random Forest is the approach, it is probably okay to leave the var as it is but I will keep an eye out while developing models
+
+# FINDING: In general, population includes mostly private workers, high school grads, people who did some college, and people with bachelors degrees, married, divorced, and never married individuals, lots of occupations, white, men, Americans, husbands - seems to not be representative of the US population 
+
+```
+
+# 5) Explore same categorical variables broken down by the target (over_50k)
+    Input: flat_eda dataframe- output from #4
+    Output: * Printed side-by-side bar graphs and cross-tab tables for each categorical variable by the target (over_50k)
+    Main Findings: 
+            * Better understanding of the type of people who make more than 50K and less than 50K in this sample
+            * Decided to group the country_name variable into 4 groups based on those with higher and lower proportions of the target variable in the subgroup
+
+```{r}
+# print cross-tab tables and side-by-side bar charts for all categorical potential predictor variables
+for (var in cat_vars) {
+
+  print(table(flat_eda[[sym(var)]],flat_eda$over_50k))
+  
+  print(ggplot(data = flat_eda, aes(x = !!sym(var), fill = over_50k)) +
+          geom_bar(stat = "count", position = position_dodge()) +
+          labs(y = "Count", x = var) +
+          scale_fill_brewer(palette = "Paired") +
+          ggtitle(paste("Bar Chart for", var)) +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)))
+
+}
+
+# Types of people who seems to make more than 50K:
+    # education level of masters, post doc, or professional degree
+    # married individuals - no kids (both husbands and wives)
+    # exec managerial and professional specialty occupations
+
+# Types of people who seem to make less than 50k:
+    # privately employed individuals
+
+# CONSIDERATION: How should the country_name variable be grouped?
+
+  #What would the side by side bar graph look like  with US removed?
+
+  print(ggplot(data = subset(flat_eda, country_name != "United-States"), aes(x = country_name, fill = over_50k)) +
+          geom_bar(stat = "count", position = position_dodge()) +
+          labs(y = "Count", x = var) +
+          scale_fill_brewer(palette = "Paired") +
+          ggtitle(paste("Bar Chart for Country (USA Removed")) +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)))
+        
+  # DECISION: group country_name variable as USA, Missing, Higher Income (according to sample - more than USA 20% of people having the target var), and Lower Income (according to sample - less than USA 20% of people having the target var)
+  
+    #get the proportion of the target for each country to see about dividing the countries into these groups
+      
+    country_prop_target <- prop.table(table(flat_eda$country_name,flat_eda$over_50k), margin=1)[,2]
+    country_prop_target <- data.frame(country=names(country_prop_target), proportion=as.numeric(country_prop_target))
+    
+    country_prop_target %>% arrange(proportion)
+    
+    # create a list of countries of origin with more than 20% of individuals of people making more than 50K
+    high_countries <- as.vector(country_prop_target %>% filter(proportion >=0.2) %>% select(country))
+    # create a list of countries of origin with less than 20% of individuals of people making more than 50K
+    low_countries <- as.vector(country_prop_target %>% filter(proportion <0.2)  %>% select(country))
+    
+    # re-create and reference these lists in program 3_census_modeling.Rmd
+    high_countries[["country"]]
+    low_countries[["country"]]
+```
+
+
+
+# 6) Explore all continuous variables that may be used as predictors in a future classification model predicting over_50k
+    Input: flat_eda dataframe- output from #4
+    Output: * Printed histograms and summary statistics for each continuous variable
+            * flat_eda_nomiss dataframe only used within this chunk to feed into the histogram to prevent warnings (all .na values ommitted)
+    Main Findings: 
+            * Decided to impute the hours_week variable with median (40) for the 137 missing values + keep a missing var flag variable
+            * Capital_gain and capital_loss have few non-zero, non-missing values in the data - keeping an eye on these variables
+
+```{r}
+# list all numeric variables other than id and education_num, since I decided to use education categorically, to feed into the subsequent loop
+flat_eda_temp <- flat_eda %>% select(-id, - education_num)
+num_vars <- flat_eda_temp %>% select_if(is.numeric) %>% colnames() 
+
+# create flat_eda_nomiss to have a dataframe without any  missing values to read into the histograms
+flat_eda_nomiss <- na.omit(flat_eda)
+
+# print summary statistics and histograms for all continuous variables
+for (var in num_vars) {
+  
+  print(var)
+  print(summary(flat_eda[,var]))
+  
+  print(ggplot(data=flat_eda_nomiss, aes(x = !!sym(var))) +
+          geom_histogram(bins=90) +
+          ggtitle(paste("Histogram for", var)) +
+          theme_classic())
+}
+
+# NOTICING:
+    # Age is looking right skewed
+    # 90 seems to be given as the age of 90+ this shouldn't really effect too much thought
+      print("Age Values")
+      table(flat_eda$age)
+      
+    # Hours/Week has a giant spike unsurprisingly around 40 
+    # 137 individuals are missing Hours/Week values - want to view these to see if there is any visible pattern
+      flat_eda %>% filter(is.na (hours_week)) %>% View()
+        # I don't see any patterns for why this might naturally be the case
+        # DECISION: Impute these values with median (40 weeks) and keep a missing flag in the data
+      
+    # Capital_gain and capital_loss both have tons and tons of zeros, makes it hard to see the distributions of those not =0- INVESTIGATE
+      
+      # INVESTIGATING: capital_gains/loses not=0
+        flat_eda_capgain <- flat_eda %>% filter(capital_gain !=0)
+        flat_eda_caploss <- flat_eda %>% filter(capital_loss !=0)
+      
+        print(ggplot(data=flat_eda_capgain, aes(x = capital_gain)) +
+                geom_histogram(bins=50) +
+                ggtitle(paste("Histogram for capital_gain")) +
+                theme_classic())
+      
+        print(ggplot(data=flat_eda_caploss, aes(x = capital_loss)) +
+                geom_histogram(bins=50) +
+                ggtitle(paste("Histogram for capital_loss")) +
+                theme_classic())
+      
+        # What proportion of values are not zero or missing for each variable?
+        nrow(flat_eda_capgain)/ nrow(flat_eda) #  ~8%
+        nrow(flat_eda_caploss)/ nrow(flat_eda) #  ~5%
+        
+        # Re-visit these variables in the next chunk while reviewing these variables by the target  
+```
+
+# 7) Explore same continuous variables broken down by the target (over_50k)
+    Input: flat_eda dataframe- output from #4
+    Output: Printed side by side density plots, boxplots, and summary statistics for each continuous variable, by the target variable
+    Main Findings: 
+            * Better understanding of the type of people who make more than 50K and less than 50K in this sample
+            * Decided to leave capital_gain and capital_loss as continuous variables
+
+```{r}
+# Use a kernel density estimator to plot these continuous variables broken up by the target variable 
+# Also quickly run boxplots
+for (var in num_vars) {
+  
+    print(ggplot(data=flat_eda, aes(x = !!sym(var))) +
+            geom_density(data=subset(flat_eda, over_50k==1), aes(fill=over_50k), alpha=0.6, position="identity") +
+            geom_density(data=subset(flat_eda, over_50k==0), aes(fill=over_50k), alpha=0.6, position="identity") +
+            ggtitle(paste("Density of ", var, " for high and low income individuals")) +
+            theme_classic())
+
+    print(ggplot(data=flat_eda, aes(x= over_50k, y = !!sym(var)), fill=class)+
+            geom_boxplot()+
+            ggtitle(paste("Side by side boxplot of ", var, " for high and low income individuals")))
+          
+    sum_var_target <- flat_eda %>%
+    group_by(over_50k) %>%
+    summarise(mean=mean(!!sym(var), na.rm = TRUE),
+              sd=sd(!!sym(var), na.rm = TRUE),
+              max=max(!!sym(var), na.rm = TRUE),
+              min=min(!!sym(var), na.rm = TRUE),
+              .groups = "drop") 
+  print(var)
+  print(sum_var_target)
+}
+
+# NOTICING:
+  # Variables differ visually based on whether the individuals are high or low income
+  # those that make over 50K seem to be older, more capital gain, more capital loss
+  # similar medians for hours/week
+
+  # Again - capital gain and capital loss - it is hard to see the distribution of the non-zero, non-missing values
+  # Look at capital gain and loss again without the 0's
+    
+    ggplot(data=flat_eda_capgain, aes(x = capital_gain)) +
+        geom_density(data=subset(flat_eda_capgain, over_50k==1), aes(fill=over_50k), alpha=0.6, position="identity") +
+        geom_density(data=subset(flat_eda_capgain, over_50k==0), aes(fill=over_50k), alpha=0.6, position="identity") +
+        ggtitle(paste("Density of capital gain for high and low income individuals")) +
+        theme_classic() 
+    
+    ggplot(data=flat_eda_capgain, aes(x= over_50k, y = capital_gain), fill=class)+
+          geom_boxplot()+
+          ggtitle(paste("Side by side boxplot of capital_gain for high and low income individuals"))
+    
+    ggplot(data=flat_eda_caploss, aes(x = capital_loss)) +
+        geom_density(data=subset(flat_eda_caploss, over_50k==1), aes(fill=over_50k), alpha=0.6, position="identity") +
+        geom_density(data=subset(flat_eda_caploss, over_50k==0), aes(fill=over_50k), alpha=0.6, position="identity") +
+        ggtitle(paste("Density of capital loss for high and low income individuals")) +
+        theme_classic() 
+    
+    ggplot(data=flat_eda_caploss, aes(x= over_50k, y = capital_loss), fill=class)+
+          geom_boxplot()+
+          ggtitle(paste("Side by side boxplot of capital_loss for high and low income individuals"))
+
+ 
+  # CONSIDER: Should I make these variables to categorical?
+      # DECISION: Looking at these distributions with 0 removed makes it look like there are some stark difference in terms of the target, at least for capital gain
+                  # I think these should be left as continuous to preserve as much information as possible
+
+  # not normally distributed distributions so quick wilcoxon ranks test - confirms general difference of medians
+  wilcox.test(age ~ over_50k , data=flat_eda)
+  wilcox.test(hours_week ~ over_50k , data=flat_eda)
+  wilcox.test(capital_gain ~ over_50k , data=flat_eda)
+  wilcox.test(capital_loss ~ over_50k , data=flat_eda)
+
+```
+
+
+
+
+

@@ -1,0 +1,593 @@
+---
+title: "3_census_modeling"
+author: "Jane Williford"
+date: "2023-01-30"
+description: This program postures data based on findings from 2_census_eda.Rmd, tunes a random forest model predicting the binary outcome of having an income of more than 50K, evaluates the final model, and build PDPs
+input: flat.csv 
+output: Capital_Gain_PDP.jpeg - final graphic used in the report output to the Output subfolder 
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1) Load libraries
+```{r}
+library(here)
+library(tidyverse)
+library(conflicted)
+
+library(randomForest)
+library(iml)
+library(pdp)
+library(ROCR)
+library(grid)
+library(gridExtra)
+library(pROC)
+library(remotes)
+install_version('InformationValue','1.2.3') # in case you have downloaded a new version of R
+#library(InformationValue)
+
+# Default to InformationValue::precision and here::here if there is a conflict
+conflict_prefer("precision", "InformationValue")
+conflict_prefer("here", "here")
+
+# Default to dplyr::select and dplyr::filter if there is a conflict
+conflicted::conflict_prefer("select","tidyverse")
+conflicted::conflict_prefer("filter","dplyr")
+
+# default to InformationValue for plotROC function
+conflicted::conflict_prefer("plotROC","InformationValue")
+
+# confirm here() is mapping to the correct project directory
+here()
+```
+
+# 2) Read the CSV into R and create a cleaned dataset ready for modeling a Random Forest - decisions made were explored in the 2_census_eda.Rmd script and described in the code chunk as well
+    Input: flat.csv from the Data subfolder
+    Output: flat_processed dataframe
+    
+```{r}
+# Read data and store as a dataframe called flat
+flat <- read.csv(file= here("Data","flat.csv"))
+
+# list of all variables that are factors to use in the flat_processed dataset creation
+factors <- c("over_50k","workclass_name","education_level_name","marital_status_name","occupation_name","race_name","sex_name","country_name","relationship_name")
+
+# Copied from 2_census_eda.Rmd to prep for creating new categorical variable for country_name in the flat_processed dataset
+
+  #get the proportion of the target for each country to see about dividing the countries into these groups
+    country_prop_target <- prop.table(table(flat$country_name,flat$over_50k), margin=1)[,2]
+    country_prop_target <- data.frame(country=names(country_prop_target), proportion=as.numeric(country_prop_target))
+    
+    # create a list of countries of origin with more than 20% of individuals of people making more than 50K
+    high_countries <- as.vector(country_prop_target %>% filter(proportion >=0.2) %>% select(country))
+    
+    # create a list of countries of origin with less than 20% of individuals of people making more than 50K
+    low_countries <- as.vector(country_prop_target %>% filter(proportion <0.2)  %>% select(country))
+
+# Create cleaned dataset ready for modeling a random forest
+    
+flat_processed <- flat %>% 
+  
+  # Remove ID variables - no value in modeling 
+  select(-ends_with("_id"), -education_num, -id) %>% 
+  
+  # Replace common missing value codes with a missing category value or an R missing value: 
+    # workclass_name, occupation_name, country_name (?),  hours_week (99)
+  mutate_at(vars(workclass_name, occupation_name, country_name), ~replace(., . == "?", 'Missing')) %>% 
+  mutate(hours_week= replace(hours_week, hours_week == 99, NA)) %>% 
+  mutate(capital_gain= replace(capital_gain, capital_gain == 99999, NA)) %>% 
+
+  # Make all categorical variables factors to work with in R
+  mutate_at(factors, as.factor) %>% 
+  
+  # Combine the country variable levels to reduce to missing, USA, countries of origin with a higher proportion of individuals making more than 50K than the US, and countries with a lower proportion of individuals making more than 50K than the US - wanted to prioritize dimentionality reduction while also maintaining some predictive power
+  
+  mutate(country_group = as.factor(ifelse(country_name %in% high_countries[["country"]] & country_name!="United-States", "Higher Income Country", ifelse(country_name %in% low_countries[["country"]], "Lower Income Country",ifelse(country_name=="United-States","United States", "Missing") )))) %>% 
+  
+  #impute the hours_week and capital gain variables with the median values (40 and 0 respectively) so we don't have missing values for this variable - confirmed that there were no patterns with these variables or known reasons why they would be missing, and didn't want to turn them categorical out of fear of losing predictive power
+  mutate(hours_week_missflag = ifelse(is.na(hours_week), 1, 0))  %>%  #MISSING VAR FLAG- to include in the model
+  mutate(hours_week = ifelse(is.na(hours_week), median(hours_week, na.rm = TRUE), hours_week))  %>%  #MAKE A VARIABLE THAT FLAGS AT THIS IS MISSING
+  mutate(capital_gain_missflag = ifelse(is.na(capital_gain), 1, 0))  %>%  #MISSING VAR FLAG- to include in the model
+  mutate(capital_gain = ifelse(is.na(capital_gain), median(capital_gain, na.rm = TRUE), capital_gain)) %>%   #MAKE A VARIABLE THAT FLAGS AT THIS IS MISSING
+  select(-country_name) # - remove country_name as it is being replaced by country_group
+
+
+# View data - check to make sure processing was done correctly and values look as expected
+summary(flat_processed$capital_gain)
+summary(flat_processed$capital_loss)
+summary(flat_processed$education_level_name)
+summary(flat_processed$hours_week)
+summary(flat_processed$country_name)
+table(flat_processed$capital_gain_missflag)
+table(flat_processed$hours_week_missflag)
+
+print(table(flat$country_name))
+
+```
+
+# 3) Split the data into a 70/20/10 training, validation, and test data split
+    Input: flat_processed dataframe from #2
+    Output: three dataframes
+              * train - the dataframe that will be used to train the future random forest model
+              * val - the dataframe that will be used to validate the different random forest model's created to pick the best one
+              * test - the dataframe that will be used to evaluate the final model selected
+
+```{r}
+# set seed - using 030398 throughout
+set.seed(030398)
+
+# Select 70% of data as sample from total 'n' rows of the data 
+train_sample <- sample.int(n = nrow(flat_processed), size = floor(.70*nrow(flat_processed)), replace = F)
+
+# get a dataset of all records not selected in train_sample - to be used for grabbing the validation sample
+intermediate  <- flat_processed[-train_sample, ]
+
+# Now select 2/3rds of the remaining data (from intermediate) for the validation sample
+val_sample <- sample.int(n = nrow(intermediate), size = floor((20/30)*nrow(intermediate)), replace = F)
+
+
+# The training dataframe
+train <- flat_processed[train_sample, ]
+
+# The validation dataframe
+val <- intermediate[val_sample, ]
+
+# The test dataframe
+test <- intermediate[-val_sample,]
+
+#CHECK to make sure there is the 70-20-30 split expected
+nrow(train)+nrow(val)+nrow(test) == nrow(flat_processed)
+nrow(train)/nrow(flat_processed) #70 %
+nrow(val)/nrow(flat_processed) # 20 %
+nrow(test)/nrow(flat_processed) # 10 %
+```
+
+# 4) Build an initial random forest model, and then tune the number of trees and the number of variables for each split - predicting the target variable over_50k 
+    Input: train dataframe from #3
+    Output: * rf_train object - the initial random forest model with all variables and 1000 trees
+            * Printed plot to evaluate different tree #'s to try
+            * Initial variable importance plot
+    WARNING: the first chunk may take a while to run
+
+
+```{r}
+# First build an initial random forest model with a large number of trees so that we can plot the change in error across different numbers of trees and pick a couple values to try
+  # tuning the # of trees
+
+set.seed(030398)
+rf_train <- randomForest(over_50k ~ ., data = train, ntree = 1000, importance = TRUE) # get variable importance as well
+```
+
+```{r}
+#Look at variable importance for the initial model- just to start to get a feel for generally important variables
+varImpPlot(rf_train,
+           sort = TRUE,
+           main = "Variable Importance")
+# focusing in on the percentage increase in MSE when the variable is excluded (how much worse the model would be if we took the variable out)
+  # note that in this context, excluded means the variable is permuted (re-arranged (target shuffling)) to 'remove' the relationship with the target
+  # the following variables seem most important: capital_gain, education_level_name, occupation_name, capital_loss, and age
+
+# plot the MSE as the # of trees increases- eyeball where it looks like the line is flattening out - here around 300 or 500? 
+plot(rf_train, main = "Number of Trees Compared to MSE")
+  # DECISION: try both a model with 300 trees and a model with 500 trees to see which performs better on the validation set
+
+```
+
+# 5) Evaluate the initial random forest model by calculating the Area Under the ROC Curve (auroc) on the validation set - even though this is the initial model, it is still an option for selection if it performs the best on the validation set
+    Input: rf_train object from #4, val dataset from #3
+    Output: * printed ROC curve with AUROC value
+            * auroc_val_1 object holding the auroc for this first initial random forest model
+
+```{r}
+# get the probabilities of the target based on the model on the validation records
+val_pred_1 <-  predict(rf_train, newdata=val, type="prob")[,2] # we want the predicted probability of a 1
+
+# Use the plotROC function to get a quick ROC curve
+InformationValue::plotROC(val$over_50k, val_pred_1)
+
+# Use the following to get a nicer ROC curve and print the AUROC so it can be copied/pasted easier
+pred_val_1 <- prediction(list(val_pred_1), val$over_50k)
+perf_val_1 <- performance(pred_val_1, measure = "tpr", x.measure = "fpr")
+plot(perf_val_1, lwd = 3, colorize = TRUE, colorkey = TRUE, main = "ROC Curve for initial RF model on val set", colorize.palette = rev(gray.colors(256)))
+abline(a = 0, b = 1, lty = 3)
+auroc_val_1 <- InformationValue::AUROC(val$over_50k, val_pred_1) 
+auroc_val_1
+##AUROC 0.9029127
+```
+
+# 6) Determine the best number of splits for a model with 300 trees and a model with 500 trees (the mtry value)
+    Input: train dataframe from #3
+    Output: * Printed plot for a model with 300 trees - optimal # of splits=3
+            * Printed plot for a model with 500 trees - optimal # of splits=3
+=
+```{r}
+set.seed(030398)
+
+# tuneRF will try and look at different values of mtry for you (already has cross-validation built in bc you took bootstrap samples with out of bag set of observations) - goes through random forest and scores random forest on out of bag observations to tell you which values of mtry give lowest values
+
+# TUNE FOR 300 TREES
+
+tuneRF(x = subset(train, select=-c(over_50k)), y = train$over_50k,
+       plot = TRUE, ntreeTry = 300, stepFactor = 0.5)
+# 3 seems to be the best (minimum) value
+
+
+# TUNE FOR 500 TREES
+
+tuneRF(x = subset(train, select=-c(over_50k)), y = train$over_50k,
+       plot = TRUE, ntreeTry = 500, stepFactor = 0.5)
+# 3 seems to be the best (minimum) value
+
+```
+
+
+# 7) Build the second random forest model predicting the target variable over_50k, using the optimal number of splits determined in #6 (3 splits) and 300 trees
+    Input: train dataframe from #3
+    Output: * rf_train2 object - the second random forest model with all variables and 300 trees
+            * Variable importance plot
+    WARNING: the first chunk may take a while to run
+
+```{r}
+set.seed(030398)
+rf_train2 <- randomForest(over_50k ~ ., data = train, ntree = 300, mtry = 3, importance = TRUE)
+```
+
+
+```{r}
+# var importance for this model
+varImpPlot(rf_train2,
+           sort = TRUE,
+           main = "Order of Variables")
+importance(rf_train2, type = 1)
+
+# capital_gain, education_level_name, occupation_name, capital_loss, and age, are still really important to what is going on
+```
+
+# 8) Evaluate the second random forest model by calculating the Area Under the ROC Curve (auroc) on the validation set
+    Input: rf_train2 object from #7, val dataset from #3
+    Output: * printed ROC curve with AUROC value
+            * auroc_val_2 object holding the auroc for this second random forest model
+
+```{r}
+# get the probabilities of the target based on the model on the validation records
+val_pred_2 <-  predict(rf_train2, newdata=val, type="prob")[,2] # we want the predicted probability of a 1
+# Use the plotROC function to get a quick ROC curve
+InformationValue::plotROC(val$over_50k, val_pred_2)
+
+# Use the following to get a nicer ROC curve and print the AUROC so it can be copied/pasted easier
+pred_val_2 <- prediction(list(val_pred_2), val$over_50k)
+perf_val_2 <- performance(pred_val_2, measure = "tpr", x.measure = "fpr")
+plot(perf_val_2, lwd = 3, colorize = TRUE, colorkey = TRUE, main = "ROC Curve for second RF model on val set", colorize.palette = rev(gray.colors(256)))
+abline(a = 0, b = 1, lty = 3)
+auroc_val_2 <- InformationValue::AUROC(val$over_50k, val_pred_2) 
+auroc_val_2
+##AUROC 0.9035869
+# the value is pretty much the same as the initial model's auroc, marginally smaller though
+```
+
+
+# 9) Build the third random forest model predicting the target variable over_50k, using the optimal number of splits determined in #6 (3 splits) and 500 trees
+    Input: train dataframe from #3
+    Output: * rf_train3 object - the third random forest model with all variables and 500 trees
+            * Variable importance plot
+    WARNING: the first chunk may take a while to run
+    
+```{r}
+# run model with the 3 vars selected for each split tuning parameter and the 500 trees, just to see
+set.seed(030398)
+rf_train3 <- randomForest(over_50k ~ ., data = train, ntree = 500, mtry = 3, importance = TRUE)
+```
+
+
+```{r}
+# var importance
+varImpPlot(rf_train3,
+           sort = TRUE,
+           main = "Order of Variables")
+importance(rf_train3, type = 1)
+
+# capital_gain, education_level_name, occupation_name, capital_loss, and age, are still really important to what is going on
+```
+
+# 10) Evaluate the third random forest model by calculating the Area Under the ROC Curve (auroc) on the validation set
+    Input: rf_train3 object from #9, val dataset from #3
+    Output: * printed ROC curve with AUROC value
+            * auroc_val_3 object holding the auroc for this third random forest model
+
+```{r}
+# get the probabilities of the target based on the model on the validation records
+val_pred_3 <-  predict(rf_train3, newdata=val, type="prob")[,2] # we want the predicted probability of a 1
+
+# Use the plotROC function to get a quick ROC curve
+InformationValue::plotROC(val$over_50k, val_pred_3) 
+
+# Use the following to get a nicer ROC curve and print the AUROC so it can be copied/pasted easier
+pred_val_3 <- prediction(list(val_pred_3), val$over_50k)
+perf_val_3 <- performance(pred_val_3, measure = "tpr", x.measure = "fpr")
+plot(perf_val_3, lwd = 3, colorize = TRUE, colorkey = TRUE, main = "ROC Curve for forth RF model on val set", colorize.palette = rev(gray.colors(256)))
+abline(a = 0, b = 1, lty = 3)
+auroc_val_3 <- InformationValue::AUROC(val$over_50k, val_pred_3) 
+auroc_val_3
+# AUROC 0.9036131
+# marginally better AUC than first 2 models
+  ## DECISION: go with 500 trees
+
+```
+
+# 11) Build a 4th random forest model predicting the target variable over_50k, using the optimal number of splits determined in #6 (3 splits) and 500 trees as determined in #10, but this time add in a random variable to see if it performs better than any of the existing predictors, if a random variable does perform better, I would suggest removing that variable
+    Input: train dataframe from #3
+    Output: * rf_train_ran object - the random forest model with the random variable added in
+            * Variable importance plot
+    WARNING: the first chunk may take a while to run
+
+```{r}
+# Include a random variable to determine variable selection
+
+set.seed(030398)
+
+train$random <- rnorm(nrow(train))
+
+rf_train_ran <- randomForest(over_50k ~ ., data = train, ntree = 500, mtry = 3, importance = TRUE)
+```
+
+
+```{r}
+varImpPlot(rf_train_ran,
+           sort = TRUE,
+           main = "Look for Variables Below Random Variable")
+importance(rf_train_ran)
+
+train <- train %>% select(-random)
+# It looks like the hours_week_missflag  actually hurts the predictive power of the model- does worse than a random variable and even negative, so removing this from the model
+```
+
+
+# 12) Build a 5th random forest model predicting the target variable over_50k, using the optimal number of splits determined in #6 (3 splits) and 500 trees as determined in #10, and without the missing flag for hours_week as a random variable was better than it - This will be the final model
+    Input: train dataframe from #3
+    Output: * rf_train_5 object - the random forest model with the random variable added in
+            * Variable importance plot
+    WARNING: the first chunk may take a while to run
+
+```{r}
+# run model with best 500 trees and 3 splits but without the hours_week_missflag variable
+set.seed(030398)
+train5_input <- train %>% 
+  select(-hours_week_missflag)
+
+rf_train5 <- randomForest(over_50k ~ ., data = train5_input, ntree = 500, mtry = 3, importance = TRUE)
+```
+
+```{r}
+# var importance
+varImpPlot(rf_train5,
+           sort = TRUE,
+           main = "Order of Variables")
+importance(rf_train5, type = 1)
+
+# capital_gain, education_level_name, occupation_name, capital_loss, and age, are still really important to what is going on
+```
+
+# 13) Evaluate the fifth random forest model by calculating the Area Under the ROC Curve (auroc) on the validation set - make sure it still performs well before selection
+    Input: rf_train5 object from #12, val dataset from #3
+    Output: * printed ROC curve with AUROC value
+            * auroc_val_5 object holding the auroc for this third random forest model
+
+```{r}
+# get the probabilities of the target based on the model on the validation records
+val_pred_5 <-  predict(rf_train5, newdata=val, type="prob")[,2] # we want the predicted probability of a 1
+
+# Use the plotROC function to get a quick ROC curve
+InformationValue::plotROC(val$over_50k, val_pred_5)
+
+# Use the following to get a nicer ROC curve and print the AUROC so it can be copied/pasted easier
+pred_val_5 <- prediction(list(val_pred_5), val$over_50k)
+perf_val_5 <- performance(pred_val_5, measure = "tpr", x.measure = "fpr")
+plot(perf_val_5, lwd = 3, colorize = TRUE, colorkey = TRUE, main = "ROC Curve for fifth RF model on val set", colorize.palette = rev(gray.colors(256)))
+abline(a = 0, b = 1, lty = 3)
+auroc_val_5 <- InformationValue::AUROC(val$over_50k, val_pred_5) 
+auroc_val_5
+##AUROC 0.9039327
+#  best AUROC 
+
+```
+
+
+# 14) Choosing fifth models the final model: 500 trees, 3 splits, all vars other than hours_week_miss_flag were used as predictors - now evaluate model on test dataset
+    Input: rf_train5 object from #12, test dataset from #3
+    Output: * rf_final_model object - a copy of the rf_train5 object 
+            * printed ROC curve with AUROC value
+            * auroc_test object holding the auroc for the final random forest model
+            * Concordance printed out (although this will be very similar to the auroc since auroc should equal the c statistic, and the c statistic should equal the concordance% +0.5*tied%)
+
+```{r}
+# - CHOOSING #5 AS THE FINAL MODEL - REMOVED UNIMPORTANT VARIABLE
+rf_final_model <- rf_train5
+
+# get the probabilities of the target based on the model on the test records
+test_pred <-  predict(rf_final_model, newdata=test, type="prob")[,2] # we want the predicted probability of a 1
+
+# Use the plotROC function to get a quick ROC curve
+InformationValue::plotROC(test$over_50k, test_pred) 
+
+# Use the following to get a nicer ROC curve and print the AUROC so it can be copied/pasted easier
+pred_test <- prediction(list(test_pred), test$over_50k)
+perf_test <- performance(pred_test, measure = "tpr", x.measure = "fpr")
+plot(perf_test, lwd = 3, colorize = TRUE, colorkey = TRUE, main = "ROC Curve for final RF model on test set", colorize.palette = rev(gray.colors(256)))
+abline(a = 0, b = 1, lty = 3)
+auroc_test <- InformationValue::AUROC(test$over_50k, test_pred) 
+auroc_test
+# 0.8969707
+
+# calculate concordance
+test$over_50k_pred <- test_pred
+
+# recall that the concordance is the rank order statistic that measures how well a model orders the predicted probabilities 
+  # compares each 0 to each 1 and sees which predicted probability is higher
+  # model is 'right' doing this ~90% of the time
+InformationValue::Concordance(test$over_50k, test$over_50k_pred)
+# 0.8994198
+
+```
+
+
+# 15) Capital gain is at the top of all of the variable importance charts, age is also consisitently up there
+      - create a chart that looks at these relationship with the probability of having the target variable in the final model - the capital gain graph will go in the report (Partial Dependence Plot - PDP)
+    Input: rf_final_model object from #14, train dataset from #3
+    Output: * PDP plots for age and capital_gain, as well as tables pdp_age_df and pdp_capital_age_df you can pull specific probabilities from
+            * Final capital_gain PDP plot output to Output folder
+
+
+```{r}
+# Can get a global interpretation of a variable using a partial dependence plot (visualize the relationship between the target and age, and the target and capital gain
+  # PDP is constructed by holding all other features constant and varying the age or the capital gain over its range. Using the training dataset the plot can see the relationship that was learned by the model.
+
+set.seed(030398)
+forest_pred <- Predictor$new(rf_final_model, data =  subset(train, select=-c(over_50k)), 
+                             y = train$over_50k, type = "prob")
+```
+
+
+```{r}
+# DEVELOP PDP FOR AGE FIRST
+pdp_plot_age <- FeatureEffects$new(forest_pred, method = "pdp", feature= "age") #WARNING: THIS LINE TAKES A SECOND TO RUN
+```
+
+```{r}
+
+plot(pdp_plot_age)
+
+#find exact values to form a table I can look at and get a prettier graph:
+pdp_age_df <- as.data.frame(pdp_plot_age[["results"]])
+pdp_age_df <- pdp_age_df %>% 
+  dplyr::filter(`age..class`==1) %>% 
+  dplyr::select(-`age..class`, -`age..type`)
+
+ggplot(data = pdp_age_df, aes(x=`age..borders`, y = `age..value`)) + 
+  geom_line() + 
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5, size = 15), 
+                     legend.title = element_text(hjust = 0.5)) + 
+  labs(x = "Age in Years", y = "Predicted Probability of Making more Than 50K Per Year", title = "Partial Dependence Plot for Age")
+
+max(pdp_age_df$`age..value`)-min(pdp_age_df$`age..value`)
+#max= 0.1587911
+```
+
+
+```{r}
+# DEVELOP PDP FOR CAPITAL GAIN
+
+pdp_plot_capital_gain <- FeatureEffects$new(forest_pred, method = "pdp", feature= "capital_gain") #WARNING: THIS LINE TAKES A SECOND TO RUN
+```
+
+```{r}
+plot(pdp_plot_capital_gain)
+
+#find exact values to form a table I can look at and get a prettier graph:
+pdp_capital_gain_df <- as.data.frame(pdp_plot_capital_gain[["results"]])
+pdp_capital_gain_df <- pdp_capital_gain_df %>% 
+  dplyr::filter(`capital_gain..class`==1) %>% 
+  dplyr::select(-`capital_gain..class`, -`capital_gain..type`)
+
+captial_gain_pdp <- ggplot(data = pdp_capital_gain_df, aes(x=`capital_gain..borders`, y = `capital_gain..value`)) + 
+  geom_line() + 
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5, size = 15), 
+                     legend.title = element_text(hjust = 0.5)) + 
+  labs(x = "Capital Gain in Dollars", y = "Predicted Probability of Making more Than 50K Per Year", title = "Partial Dependence Plot for Capital Gain")
+
+print(captial_gain_pdp)
+
+max(pdp_capital_gain_df$`capital_gain..value`)-min(pdp_capital_gain_df$`capital_gain..value`)
+# 0.6950567
+
+ggsave(here::here("Output","Capital_Gain_PDP.png"),width = 7, height = 5,plot=captial_gain_pdp)
+
+```
+
+
+# 16) EXTRA - JUST TO SEE - I wanted to look at the prediction broken up by racial group and gender since the sample seemed bias toward white men
+      - Didn't look like anything too interesting was going on after a brief look, but it would be interesting to look into other subgroups too
+    Input: rf_final_model object from #14, test dataset from #3
+    Output: * plots of ROC curves and values for subgroups of people (racial and sex)
+
+```{r}
+
+table(test$race_name)
+
+white_pred <- predict(rf_final_model, newdata=subset(test,race_name=="White"), type="prob")[,2] 
+black_pred <- predict(rf_final_model, newdata=subset(test,race_name=="Black"), type="prob")[,2] 
+other_pred <- predict(rf_final_model, newdata=subset(test,race_name=="Other"), type="prob")[,2] 
+API_pred <- predict(rf_final_model, newdata=subset(test,race_name=="Asian-Pac-Islander"), type="prob")[,2] 
+AIE_pred <- predict(rf_final_model, newdata=subset(test,race_name=="Amer-Indian-Eskimo"), type="prob")[,2] 
+
+print("White")
+InformationValue::plotROC(subset(test,race_name=="White")$over_50k, white_pred) 
+print("Black")
+InformationValue::plotROC(subset(test,race_name=="Black")$over_50k, black_pred) 
+print("Other")
+InformationValue::plotROC(subset(test,race_name=="Other")$over_50k, other_pred) 
+print("Asian-Pac-Islander")
+InformationValue::plotROC(subset(test,race_name=="Asian-Pac-Islander")$over_50k, API_pred) 
+print("Amer-Indian-Eskimo")
+InformationValue::plotROC(subset(test,race_name=="Amer-Indian-Eskimo")$over_50k, AIE_pred) 
+# plots all hover around the same AUROC
+
+table(test$sex_name)
+
+Female_pred <- predict(rf_final_model, newdata=subset(test,sex_name=="Female"), type="prob")[,2] 
+Male_pred <- predict(rf_final_model, newdata=subset(test,sex_name=="Male"), type="prob")[,2] 
+
+print("Female")
+InformationValue::plotROC(subset(test,sex_name=="Female")$over_50k, Female_pred) 
+print("Male")
+InformationValue::plotROC(subset(test,sex_name=="Male")$over_50k, Male_pred) 
+# plots all hover around the same AUROC
+
+
+```
+
+# 17) EXTRA - JUST TO SEE - I was curious what a single decision tree would look like
+    Input: rf_final_model object from #14, test dataset from #3
+    Output: decision tree var importance and visual plot - interesting how different one tree looks from the random forest
+
+
+```{r}
+set.seed(030398)
+library(rpart)
+library(rpart.plot)
+
+tree = rpart(over_50k ~ . , data=train5_input, method='class', parms = list(split='gini')) ## or 'information'
+
+summary(tree)
+## CP= Complexity Parameter (0.01 Cutoff) - controls processing time = how much R2 increases
+## nsplit= the number of splits performed
+## rel error, xerror, and xstd are all scaled at 1
+## xerror and xstd are the cross validation error and std
+
+print(tree)
+## Gives Node Number - based on a fully filled out tree
+## then # of individuals in leaf
+## then number of miss classified individuals
+## then gives the classification based on probability (0 if more 0's, 1 if more 1's)
+## then gives (0%, 1%)
+
+tree$variable.importance
+# variable importance, meaning how well the split can produce pure nodes, and how often you split on that variable
+
+varimp.data=data.frame(tree$variable.importance)
+varimp.data$names=as.character(rownames(varimp.data))
+
+ggplot(data=varimp.data,aes(x=names,y=tree.variable.importance))+geom_bar(stat="identity")+coord_flip()+labs(x="Variable Name",y="Variable Importance")
+
+rpart.plot(tree)
+
+# an observation is classified by running it down the tree - can see that people who tend to have y outcome have x qualities
+
+# top= predicted class 
+# middle = P(target)=1
+# bottom = percent of all cases in node
+```
+
+
